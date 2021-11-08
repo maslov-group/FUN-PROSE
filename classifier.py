@@ -27,7 +27,6 @@ else:
     def cudaify(model):
         return model
 
-
 class Vocab:
     """
     A simple vocabulary class that takes an alphabet of symbols,
@@ -118,25 +117,31 @@ class ProCNN(torch.nn.Module):
         self.conv1 = torch.nn.Conv1d(len(input_symbol_vocab),128, kernel_size=15, stride=1, padding=15//2)
         self.pool1 = torch.nn.MaxPool1d(kernel_size=20, stride=20)
         self.activation1 = self.get_activation(config["activation"])
+        self.conv1dropout = torch.nn.Dropout(config["conv_dropout"])
         
         self.conv2 = torch.nn.Conv1d(128,32, kernel_size=9, stride=1, padding=9//2)
         self.pool2 = torch.nn.MaxPool1d(kernel_size=10, stride=10)
         self.activation2 = self.get_activation(config["activation"])
+        self.conv2dropout = torch.nn.Dropout(config["conv_dropout"])
         
         self.fc_t = torch.nn.Linear(325,self.xt_hidden) #assuming 325 TFs
         self.fc_t_activation = self.get_activation(config["activation"])
+        self.fc_t_dropout = torch.nn.Dropout(config["fc_dropout"])
         
         self.fc1 = torch.nn.Linear(32*self.xs_hidden+self.xt_hidden, 512)
         self.bn1 = torch.nn.BatchNorm1d(num_features=512)
-        self.fc_activation1 = self.get_activation(config["activation"])
+        self.fc1_activation = self.get_activation(config["activation"])
+        self.fc1_dropout = torch.nn.Dropout(config["fc_dropout"])
         
         self.fc2 = torch.nn.Linear(512, 256)
         self.bn2 = torch.nn.BatchNorm1d(num_features=256)
-        self.fc_activation2 = self.get_activation(config["activation"])
+        self.fc2_activation = self.get_activation(config["activation"])
+        self.fc2_dropout = torch.nn.Dropout(config["fc_dropout"])
         
         self.fc3 = torch.nn.Linear(256, 64)
         self.bn3 = torch.nn.BatchNorm1d(num_features=64)
-        self.fc_activation3 = self.get_activation(config["activation"])
+        self.fc3_activation = self.get_activation(config["activation"])
+        self.fc3_dropout = torch.nn.Dropout(config["fc_dropout"])
         
         self.fc_out = torch.nn.Linear(64,1)
         
@@ -159,26 +164,32 @@ class ProCNN(torch.nn.Module):
         x_s = self.conv1(x_s)
         x_s = self.pool1(x_s)
         x_s = self.activation1(x_s)
+        x_s = self.conv1dropout(x_s)
         
         x_s = self.conv2(x_s)
         x_s = self.pool2(x_s)
         x_s = self.activation2(x_s)
+        x_s = self.conv2dropout(x_s)
         
         x_t = self.fc_t(x_t)
         x_t = self.fc_t_activation(x_t)
+        x_t = self.fc_t_dropout(x_t)
         
         x = torch.cat((x_s.reshape((b,32*self.xs_hidden,1)).view(-1, 32*self.xs_hidden),x_t),1)
         x = self.fc1(x)
         x = self.bn1(x)
-        x = self.fc_activation1(x)
+        x = self.fc1_activation(x)
+        x = self.fc1_dropout(x)
         
         x = self.fc2(x)
         x = self.bn2(x)
-        x = self.fc_activation2(x)
+        x = self.fc2_activation(x)
+        x = self.fc2_dropout(x)
         
         x = self.fc3(x)
         x = self.bn3(x)
-        x = self.fc_activation3(x)
+        x = self.fc3_activation(x)
+        x = self.fc3_dropout(x)
         
         x = self.fc_out(x)
         #print(self.convs[0].weight.data)
@@ -213,8 +224,8 @@ class Trainable(tune.Trainable):
         return torch.nn.MSELoss()
     
     @classmethod
-    def correlation(self):
-        return pearsonr
+    def correlation(self, x, y):
+        return pearsonr(x, y)[0]
     
     def step(self):
         self.net.train()
@@ -234,7 +245,7 @@ class Trainable(tune.Trainable):
         all_labels = []
         all_preds = []
         
-        for data in (self.train_loader if train else self.eval_loader):
+        for data in (self.train_loader if train else self.dev_loader):
             if train:
                 self.optimizer.zero_grad()
         
@@ -302,6 +313,7 @@ def search_hyperparameters(experiment_name, search_space, output_classes, trains
         brackets=1
     )
 
+    print("Starting search")
     results = tune.run(tune.with_parameters(Trainable, 
                                             char_vocab=char_vocab,
                                             category_vocab=category_vocab,
@@ -310,11 +322,12 @@ def search_hyperparameters(experiment_name, search_space, output_classes, trains
                                             devset=devset),
                         config=search_space, 
                         name=experiment_name, 
-                        resources_per_trial={"cpu" : 40, "gpu" : 1},
-                        num_samples=1, 
+                        resources_per_trial={"cpu" : 16, "gpu" : 1},
+                        num_samples=50, 
                         search_alg=bayesopt, 
                         scheduler=scheduler,
                         stop=stopper,
+                        max_concurrent_trials=2,
                         fail_fast=True)
     
     return results
@@ -327,11 +340,23 @@ if __name__ == "__main__":
        "seq_length": tune.choice([i * 100 for i in range(1, 11)]),
        "batch_size": tune.choice([2, 4, 8, 16, 32, 64, 128, 256]),
        "activation" : tune.choice(["relu", "gelu", "elu"]),
+       "conv_dropout": tune.uniform(0, 0.50),
+       "tf_dropout": tune.uniform(0, 0.50),
+       "fc_dropout": tune.uniform(0, 0.50),
     }
 
 
-    trainset = JsonDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_testGenes.json')
+    print("Loading data")
+    trainset = JsonDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_trainGenes.json')
     devset = JsonDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_validGenes.json')
+    print("Loaded data")
+
+    ray.init(
+        num_cpus = 32, 
+        object_store_memory=1024 * 1024 * 1024,
+        _redis_max_memory=1024*1024*1024,
+        _memory=1024*1024*1024
+    )
 
     results = search_hyperparameters("2021-11-06", search_space, 1, trainset, devset)
     
