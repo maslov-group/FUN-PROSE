@@ -8,17 +8,19 @@ from scipy.stats import pearsonr
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from data import JsonDataset, get_samplers
-from data import domain, split_data
+from data import JsonDataset
 
 ### Device set-up
-if True:
+use_cuda = True
+
+if use_cuda:
     print("using gpu")
     cuda = torch.device('cuda')
     FloatTensor = torch.cuda.FloatTensor
     LongTensor = torch.cuda.LongTensor
     def cudaify(model):
         return model.cuda()
+    scaler = torch.cuda.amp.GradScaler
 else: 
     print("using cpu")
     cuda = torch.device('cpu')
@@ -26,6 +28,14 @@ else:
     LongTensor = torch.LongTensor
     def cudaify(model):
         return model
+    def MockScaler():
+        def scale(self, x):
+            return x
+        def step(self, optim):
+            optimizer.step()
+        def update(self):
+            pass
+    scaler = MockScaler
 
 class Vocab:
     """
@@ -107,40 +117,41 @@ class ProCNN(torch.nn.Module):
     def __init__(self, config, output_classes, input_symbol_vocab):
         super(ProCNN, self).__init__()
         
+        self.config = config
         self.input_symbol_vocab = input_symbol_vocab
         
         self.xt_hidden = config["xt_hidden"]
-        self.xs_hidden = config["seq_length"] // (20 * 10)
+        self.xs_hidden = config["seq_length"] // (config["pool1"] * config["pool2"])
 
         self.output_classes = output_classes
         
-        self.conv1 = torch.nn.Conv1d(len(input_symbol_vocab),128, kernel_size=15, stride=1, padding=15//2)
-        self.pool1 = torch.nn.MaxPool1d(kernel_size=20, stride=20)
-        self.activation1 = self.get_activation(config["activation"])
+        self.conv1 = torch.nn.Conv1d(len(input_symbol_vocab),config["conv1_knum"], kernel_size=config["conv1_ksize"], stride=1, padding=config["conv1_ksize"]//2)
+        self.pool1 = torch.nn.MaxPool1d(kernel_size=config["pool1"], stride=config["pool1"])
+        self.activation1 = self.get_activation(config["conv_activation"])
         self.conv1dropout = torch.nn.Dropout(config["conv_dropout"])
         
-        self.conv2 = torch.nn.Conv1d(128,32, kernel_size=9, stride=1, padding=9//2)
-        self.pool2 = torch.nn.MaxPool1d(kernel_size=10, stride=10)
-        self.activation2 = self.get_activation(config["activation"])
+        self.conv2 = torch.nn.Conv1d(config["conv1_knum"],config["conv2_knum"], kernel_size=config["conv2_ksize"], stride=1, padding=config["conv2_ksize"]//2)
+        self.pool2 = torch.nn.MaxPool1d(kernel_size=config["pool2"], stride=config["pool2"])
+        self.activation2 = self.get_activation(config["conv_activation"])
         self.conv2dropout = torch.nn.Dropout(config["conv_dropout"])
         
         self.fc_t = torch.nn.Linear(325,self.xt_hidden) #assuming 325 TFs
-        self.fc_t_activation = self.get_activation(config["activation"])
+        self.fc_t_activation = self.get_activation(config["fc_activation"])
         self.fc_t_dropout = torch.nn.Dropout(config["fc_dropout"])
         
-        self.fc1 = torch.nn.Linear(32*self.xs_hidden+self.xt_hidden, 512)
+        self.fc1 = torch.nn.Linear(config["conv2_knum"]*self.xs_hidden+self.xt_hidden, 512)
         self.bn1 = torch.nn.BatchNorm1d(num_features=512)
-        self.fc1_activation = self.get_activation(config["activation"])
+        self.fc1_activation = self.get_activation(config["fc_activation"])
         self.fc1_dropout = torch.nn.Dropout(config["fc_dropout"])
         
         self.fc2 = torch.nn.Linear(512, 256)
         self.bn2 = torch.nn.BatchNorm1d(num_features=256)
-        self.fc2_activation = self.get_activation(config["activation"])
+        self.fc2_activation = self.get_activation(config["fc_activation"])
         self.fc2_dropout = torch.nn.Dropout(config["fc_dropout"])
         
         self.fc3 = torch.nn.Linear(256, 64)
         self.bn3 = torch.nn.BatchNorm1d(num_features=64)
-        self.fc3_activation = self.get_activation(config["activation"])
+        self.fc3_activation = self.get_activation(config["fc_activation"])
         self.fc3_dropout = torch.nn.Dropout(config["fc_dropout"])
         
         self.fc_out = torch.nn.Linear(64,1)
@@ -153,6 +164,8 @@ class ProCNN(torch.nn.Module):
             return torch.nn.GELU()
         elif activation == "elu":
             return torch.nn.ELU()
+        elif activation == "selu":
+            return torch.nn.SELU()
         else:
             raise ValueError("Invalid activation function: must be relu, gelu, or elu.")
     
@@ -175,7 +188,7 @@ class ProCNN(torch.nn.Module):
         x_t = self.fc_t_activation(x_t)
         x_t = self.fc_t_dropout(x_t)
         
-        x = torch.cat((x_s.reshape((b,32*self.xs_hidden,1)).view(-1, 32*self.xs_hidden),x_t),1)
+        x = torch.cat((x_s.reshape((b,self.config["conv2_knum"]*self.xs_hidden,1)).view(-1, self.config["conv2_knum"]*self.xs_hidden),x_t),1)
         x = self.fc1(x)
         x = self.bn1(x)
         x = self.fc1_activation(x)
@@ -211,10 +224,11 @@ class Trainable(tune.Trainable):
         """
         print("Setting up Trainable")
         self.config = config
+        self.scaler = scaler()
         self.tensorize = Tensorize(char_vocab, config["seq_length"], category_vocab)
         self.char_vocab = char_vocab
-        self.train_loader = DataLoader(trainset, batch_size=config["batch_size"], num_workers=8)
-        self.dev_loader = DataLoader(devset, batch_size=config["batch_size"], num_workers=8)
+        self.train_loader = DataLoader(trainset, batch_size=config["batch_size"], num_workers=4, shuffle=True)
+        self.dev_loader = DataLoader(devset, batch_size=config["batch_size"], num_workers=4, shuffle=False)
             
         self.net = cudaify(ProCNN(config, output_classes, char_vocab))
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=config["learning_rate"])
@@ -229,12 +243,11 @@ class Trainable(tune.Trainable):
     
     def step(self):
         self.net.train()
-        train_loss, train_corr = self.run_one_cycle(True)
+        train_loss = self.run_one_cycle(True)
         self.net.eval()
         dev_loss, dev_corr = self.run_one_cycle(False)
         
         return {"train_loss" : train_loss,
-                "train_corr" : train_corr,
                 "dev_loss" : dev_loss,
                 "dev_corr" : dev_corr
         }
@@ -242,28 +255,41 @@ class Trainable(tune.Trainable):
     def run_one_cycle(self, train=True):
         total_loss = 0
         
-        all_labels = []
-        all_preds = []
+        if not train:
+            all_labels = []
+            all_preds = []
         
-        for data in (self.train_loader if train else self.dev_loader):
+        for i, data in enumerate(self.train_loader if train else self.dev_loader):
+            print(i, "/", len(self.train_loader if train else self.dev_loader))
             if train:
                 self.optimizer.zero_grad()
         
             input_s, input_t, labels = self.tensorize(data)
             outputs = self.net(input_s, input_t).view(-1)
-            loss = self.objective()(outputs, labels)
-            
+            if use_cuda:
+                with torch.cuda.amp.autocast():
+                    loss = self.objective()(outputs, labels)
+            else:
+                loss = self.objective()(outputs, labels)
+
             total_loss += loss.data.item()
-            all_labels.extend(labels.tolist())
-            all_preds.extend(outputs.tolist())
+            
+            if not train:
+                all_labels.extend(labels.tolist())
+                all_preds.extend(outputs.tolist())
             
             if train:
-                loss.backward()
-                self.optimizer.step()
-                
-        total_corr = self.correlation(all_labels, all_preds)
-        return total_loss, total_corr
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+
+        total_loss = total_loss / len(self.train_loader if train else self.dev_loader)
+        if not train:
+            total_corr = self.correlation(all_labels, all_preds)
+            return total_loss, total_corr
     
+        return total_loss
+
     def save_checkpoint(self, checkpoint_dir):
         path = os.path.join(checkpoint_dir, "checkpoint.pt")
         
@@ -307,7 +333,7 @@ def search_hyperparameters(experiment_name, search_space, output_classes, trains
         time_attr='training_iteration',
         metric='dev_corr',
         mode='max',
-        max_t=200,
+        max_t=100,
         grace_period=10,
         reduction_factor=3,
         brackets=1
@@ -320,11 +346,11 @@ def search_hyperparameters(experiment_name, search_space, output_classes, trains
                                             output_classes=output_classes,
                                             trainset=trainset,
                                             devset=devset),
-                        config=search_space, 
-                        name=experiment_name, 
-                        resources_per_trial={"cpu" : 16, "gpu" : 1},
-                        num_samples=50, 
-                        search_alg=bayesopt, 
+                        config=search_space,
+                        name=experiment_name,
+                        resources_per_trial={"cpu" : 8, "gpu" : 0.5},
+                        num_samples=500,
+                        search_alg=bayesopt,
                         scheduler=scheduler,
                         stop=stopper,
                         max_concurrent_trials=2,
@@ -338,8 +364,15 @@ if __name__ == "__main__":
        "learning_rate": tune.loguniform(1e-5, 1e-1),
        "xt_hidden": tune.choice([16, 32, 64, 128, 256, 512, 1024]),
        "seq_length": tune.choice([i * 100 for i in range(1, 11)]),
+       "conv1_ksize": tune.choice([7, 9, 11, 13, 15]),
+       "conv1_knum": tune.choice([16, 32, 64, 128, 256]),
+       "pool1": tune.randint(1,20),
+       "conv2_ksize": tune.choice([7, 9, 11, 13, 15]),
+       "conv2_knum": tune.choice([16, 32, 64, 128, 256]),
+       "pool2": tune.randint(1,20),
        "batch_size": tune.choice([2, 4, 8, 16, 32, 64, 128, 256]),
-       "activation" : tune.choice(["relu", "gelu", "elu"]),
+       "conv_activation" : tune.choice(["relu", "gelu", "elu", "selu"]),
+       "fc_activation" : tune.choice(["relu", "gelu", "elu", "selu"]),
        "conv_dropout": tune.uniform(0, 0.50),
        "tf_dropout": tune.uniform(0, 0.50),
        "fc_dropout": tune.uniform(0, 0.50),
@@ -352,13 +385,12 @@ if __name__ == "__main__":
     print("Loaded data")
 
     ray.init(
-        num_cpus = 32, 
-        object_store_memory=1024 * 1024 * 1024,
-        _redis_max_memory=1024*1024*1024,
-        _memory=1024*1024*1024
+        num_cpus = 16,
+        object_store_memory=10 * 1024 * 1024 * 1024,
+        _redis_max_memory=3*1024*1024*1024,
     )
 
-    results = search_hyperparameters("2021-11-06", search_space, 1, trainset, devset)
+    results = search_hyperparameters("2021-11-09", search_space, 1, trainset, devset)
     
     best_trial = result.best_trial
     print("Best trial config: {}".format(best_trial.config))
