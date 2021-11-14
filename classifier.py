@@ -7,9 +7,9 @@ from ray import tune
 from ray.tune.suggest.skopt import SkOptSearch
 from scipy.stats import pearsonr
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 
-from data import JsonDataset
+from data import PandasDataset
 
 torch.backends.cudnn.benchmark = True
 
@@ -203,8 +203,8 @@ class Trainable(tune.Trainable):
         self.scaler = scaler()
         self.tensorize = Tensorize(char_vocab, config["seq_length"])
         self.char_vocab = char_vocab
-        self.train_loader = DataLoader(trainset, batch_size=config["batch_size"], num_workers=4, pin_memory=True, shuffle=True)
-        self.dev_loader = DataLoader(devset, batch_size=config["batch_size"], num_workers=4, pin_memory=True, shuffle=False)
+        self.train_loader = DataLoader(trainset, batch_size=config["batch_size"], num_workers=8, pin_memory=True, shuffle=True)
+        self.dev_loader = DataLoader(devset, batch_size=config["batch_size"], num_workers=8, pin_memory=True, shuffle=False)
             
         self.net = cudaify_model(ProCNN(config, output_classes, char_vocab))
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=config["learning_rate"])
@@ -221,7 +221,8 @@ class Trainable(tune.Trainable):
         with torch.no_grad():
             dev_loss, dev_corr = self.run_one_cycle(train=False)
         
-        return {"train_loss" : train_loss,
+        return {
+                "train_loss" : train_loss,
                 "dev_loss" : dev_loss,
                 "dev_corr" : dev_corr
         }
@@ -247,7 +248,7 @@ class Trainable(tune.Trainable):
                 loss = self.loss(outputs, labels)
             
             if not train:
-                all_labels.extend(labels.tolist())
+                all_labels.extend(labels.detach().tolist())
                 all_preds.extend(outputs.detach().tolist())
             
             if train:
@@ -311,7 +312,7 @@ def search_hyperparameters(args, search_space, output_classes, trainset, devset)
         metric='dev_corr',
         mode='max',
         max_t=50,
-        grace_period=10,
+        grace_period=5,
         reduction_factor=3,
         brackets=1
     )
@@ -324,15 +325,16 @@ def search_hyperparameters(args, search_space, output_classes, trainset, devset)
                                             devset=devset),
                         config=search_space,
                         name=args.name,
-                        resources_per_trial={"cpu" : 10, "gpu" : 0.25},
+                        resources_per_trial={"cpu" : 16, "gpu" : 0.5},
                         num_samples=args.num_trials,
                         search_alg=bayesopt,
                         scheduler=scheduler,
                         stop=stopper,
                         max_concurrent_trials=args.num_concurrent,
-                        checkpoint_freq=10,
+                        checkpoint_freq=1,
                         checkpoint_at_end=True,
-                        fail_fast=True)
+                        fail_fast=True,
+                        resume="AUTO")
     
     return results
 
@@ -349,7 +351,7 @@ if __name__ == "__main__":
 
     ray.init(
             num_cpus = args.num_cpus,
-            object_store_memory=2*1024*1024*1024,
+            object_store_memory=1*1024*1024*1024,
             _redis_max_memory=5*1024*1024*1024,
             include_dashboard=False,
     )
@@ -401,8 +403,8 @@ if __name__ == "__main__":
 
 
     print("Loading data")
-    trainset = JsonDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_trainGenes.json')
-    devset = JsonDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_validGenes.json')
+    trainset = PandasDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_trainGenes.pkl')
+    devset = PandasDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_validGenes.pkl')
     print("Loaded data")
     results = search_hyperparameters(args, search_space, 1, trainset, devset)
     
