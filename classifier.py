@@ -1,3 +1,4 @@
+import argparse
 from copy import deepcopy
 import os
 import pandas as pd
@@ -10,32 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from data import JsonDataset
 
-### Device set-up
-use_cuda = True
-
-if use_cuda:
-    print("using gpu")
-    cuda = torch.device('cuda')
-    FloatTensor = torch.cuda.FloatTensor
-    LongTensor = torch.cuda.LongTensor
-    def cudaify(model):
-        return model.cuda()
-    scaler = torch.cuda.amp.GradScaler
-else: 
-    print("using cpu")
-    cuda = torch.device('cpu')
-    FloatTensor = torch.FloatTensor
-    LongTensor = torch.LongTensor
-    def cudaify(model):
-        return model
-    def MockScaler():
-        def scale(self, x):
-            return x
-        def step(self, optim):
-            optimizer.step()
-        def update(self):
-            pass
-    scaler = MockScaler
+torch.backends.cudnn.benchmark = True
 
 class Vocab:
     """
@@ -69,9 +45,8 @@ class Tensorize:
     a neural network.
     """
     
-    def __init__(self, symbol_vocab, max_word_length, category_vocab):
+    def __init__(self, symbol_vocab, max_word_length):
         self.symbol_vocab = symbol_vocab
-        self.category_vocab = category_vocab
         self.max_word_length = max_word_length
     
     def __call__(self, data):
@@ -211,7 +186,7 @@ class ProCNN(torch.nn.Module):
     
 class Trainable(tune.Trainable):
     
-    def setup(self, config, output_classes, char_vocab, category_vocab, trainset, devset):
+    def setup(self, config, output_classes, char_vocab, trainset, devset):
         """
         Initializes a trainer to train a neural network using the provided DataLoaders 
         (for training and development data).
@@ -224,28 +199,27 @@ class Trainable(tune.Trainable):
         """
         print("Setting up Trainable")
         self.config = config
+        self.use_cuda = config["use_cuda"]
         self.scaler = scaler()
-        self.tensorize = Tensorize(char_vocab, config["seq_length"], category_vocab)
+        self.tensorize = Tensorize(char_vocab, config["seq_length"])
         self.char_vocab = char_vocab
-        self.train_loader = DataLoader(trainset, batch_size=config["batch_size"], num_workers=4, shuffle=True)
-        self.dev_loader = DataLoader(devset, batch_size=config["batch_size"], num_workers=4, shuffle=False)
+        self.train_loader = DataLoader(trainset, batch_size=config["batch_size"], num_workers=4, pin_memory=True, shuffle=True)
+        self.dev_loader = DataLoader(devset, batch_size=config["batch_size"], num_workers=4, pin_memory=True, shuffle=False)
             
-        self.net = cudaify(ProCNN(config, output_classes, char_vocab))
+        self.net = cudaify_model(ProCNN(config, output_classes, char_vocab))
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=config["learning_rate"])
+        self.loss = torch.nn.MSELoss()
         
-    @classmethod
-    def objective(cls):
-        return torch.nn.MSELoss()
-    
     @classmethod
     def correlation(self, x, y):
         return pearsonr(x, y)[0]
     
     def step(self):
         self.net.train()
-        train_loss = self.run_one_cycle(True)
+        train_loss = self.run_one_cycle(train=True)
         self.net.eval()
-        dev_loss, dev_corr = self.run_one_cycle(False)
+        with torch.no_grad():
+            dev_loss, dev_corr = self.run_one_cycle(train=False)
         
         return {"train_loss" : train_loss,
                 "dev_loss" : dev_loss,
@@ -266,22 +240,23 @@ class Trainable(tune.Trainable):
         
             input_s, input_t, labels = self.tensorize(data)
             outputs = self.net(input_s, input_t).view(-1)
-            if use_cuda:
+            if self.use_cuda:
                 with torch.cuda.amp.autocast():
-                    loss = self.objective()(outputs, labels)
+                    loss = self.loss(outputs, labels)
             else:
-                loss = self.objective()(outputs, labels)
-
-            total_loss += loss.data.item()
+                loss = self.loss(outputs, labels)
             
             if not train:
                 all_labels.extend(labels.tolist())
-                all_preds.extend(outputs.tolist())
+                all_preds.extend(outputs.detach().tolist())
             
             if train:
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+
+            total_loss += loss.detach().item()
+
 
         total_loss = total_loss / len(self.train_loader if train else self.dev_loader)
         if not train:
@@ -294,18 +269,22 @@ class Trainable(tune.Trainable):
         path = os.path.join(checkpoint_dir, "checkpoint.pt")
         
         torch.save({
-            "epoch": self.epoch,
             "model_state_dict": self.net.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict()
         }, path)
+
+        return checkpoint_dir
+
+
         
     def load_checkpoint(self, checkpoint_path):
-        state = torch.load(checkpoint_path)
+        path = os.path.join(checkpoint_path, "checkpoint.pt")
+        state = torch.load(path)
         self.net.load_state_dict(state["model_state_dict"])
         self.optimizer.load_state_dict(state["optimizer_state_dict"])        
             
 
-def search_hyperparameters(experiment_name, search_space, output_classes, trainset, devset):
+def search_hyperparameters(args, search_space, output_classes, trainset, devset):
     """
     Performs a hyperparameter search of the best-performing network
     for the given datasets (training and development).
@@ -320,8 +299,6 @@ def search_hyperparameters(experiment_name, search_space, output_classes, trains
         return ['A', 'C', 'G', 'N', 'T']
 
     char_vocab = Vocab(extract_amino_acid_alphabet(trainset))    
-    categories = sorted(list(set(trainset.select('exp'))))
-    category_vocab = Vocab(categories)
 
     bayesopt = SkOptSearch(metric="dev_corr", mode="max")
     
@@ -333,7 +310,7 @@ def search_hyperparameters(experiment_name, search_space, output_classes, trains
         time_attr='training_iteration',
         metric='dev_corr',
         mode='max',
-        max_t=100,
+        max_t=50,
         grace_period=10,
         reduction_factor=3,
         brackets=1
@@ -342,40 +319,84 @@ def search_hyperparameters(experiment_name, search_space, output_classes, trains
     print("Starting search")
     results = tune.run(tune.with_parameters(Trainable, 
                                             char_vocab=char_vocab,
-                                            category_vocab=category_vocab,
                                             output_classes=output_classes,
                                             trainset=trainset,
                                             devset=devset),
                         config=search_space,
-                        name=experiment_name,
-                        resources_per_trial={"cpu" : 8, "gpu" : 0.5},
-                        num_samples=500,
+                        name=args.name,
+                        resources_per_trial={"cpu" : 10, "gpu" : 0.25},
+                        num_samples=args.num_trials,
                         search_alg=bayesopt,
                         scheduler=scheduler,
                         stop=stopper,
-                        max_concurrent_trials=2,
+                        max_concurrent_trials=args.num_concurrent,
+                        checkpoint_freq=10,
+                        checkpoint_at_end=True,
                         fail_fast=True)
     
     return results
 
 
 if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Hyperparameter search for FUN-PROSE")
+    parser.add_argument("-name", type=str, required=True)
+    parser.add_argument("-num_cpus", type=int, required=True)
+    parser.add_argument("-num_trials", type=int, required=True)
+    parser.add_argument("-num_concurrent", type=int, required=True)
+    parser.add_argument("-use_cuda", type=bool, default=False)
+    args = parser.parse_args()
+
+    ray.init(
+            num_cpus = args.num_cpus,
+            object_store_memory=2*1024*1024*1024,
+            _redis_max_memory=5*1024*1024*1024,
+            include_dashboard=False,
+    )
+
+    if args.use_cuda:
+        print("Using GPU")
+        FloatTensor = torch.cuda.FloatTensor
+        LongTensor = torch.cuda.LongTensor
+        def cudaify_model(x):
+            return x.cuda()
+        def cudaify(x):
+            return x.cuda(non_blocking=True)
+        scaler = torch.cuda.amp.GradScaler
+    else:
+        print("Using CPU")
+        FloatTensor = torch.FloatTensor
+        LongTensor = torch.LongTensor
+        def cudaify_model(x):
+            return x
+        def cudaify(x):
+            return x
+        class MockScaler():
+            def scale(self, x):
+                return x
+            def step(self, optim):
+                optim.step()
+            def update(self):
+                pass
+        scaler = MockScaler
+
     search_space = {
-       "learning_rate": tune.loguniform(1e-5, 1e-1),
-       "xt_hidden": tune.choice([16, 32, 64, 128, 256, 512, 1024]),
-       "seq_length": tune.choice([i * 100 for i in range(1, 11)]),
-       "conv1_ksize": tune.choice([7, 9, 11, 13, 15]),
+       "learning_rate": tune.loguniform(1e-5, 1e-2),
+       "xt_hidden": tune.choice([32, 64, 128, 256, 512, 1024]),
+       "seq_length": tune.choice([i * 100 for i in range(2, 11)]),
+       "conv1_ksize": tune.choice([9, 11, 13, 15]),
        "conv1_knum": tune.choice([16, 32, 64, 128, 256]),
-       "pool1": tune.randint(1,20),
-       "conv2_ksize": tune.choice([7, 9, 11, 13, 15]),
+       "pool1": tune.randint(5,20),
+       "conv2_ksize": tune.choice([9, 11, 13, 15]),
        "conv2_knum": tune.choice([16, 32, 64, 128, 256]),
-       "pool2": tune.randint(1,20),
-       "batch_size": tune.choice([2, 4, 8, 16, 32, 64, 128, 256]),
+       "pool2": tune.randint(5,10),
+       "batch_size": tune.choice([16, 32, 64, 128, 256]),
        "conv_activation" : tune.choice(["relu", "gelu", "elu", "selu"]),
        "fc_activation" : tune.choice(["relu", "gelu", "elu", "selu"]),
        "conv_dropout": tune.uniform(0, 0.50),
        "tf_dropout": tune.uniform(0, 0.50),
        "fc_dropout": tune.uniform(0, 0.50),
+       "use_cuda": args.use_cuda,
     }
 
 
@@ -383,14 +404,7 @@ if __name__ == "__main__":
     trainset = JsonDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_trainGenes.json')
     devset = JsonDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_validGenes.json')
     print("Loaded data")
-
-    ray.init(
-        num_cpus = 16,
-        object_store_memory=10 * 1024 * 1024 * 1024,
-        _redis_max_memory=3*1024*1024*1024,
-    )
-
-    results = search_hyperparameters("2021-11-09", search_space, 1, trainset, devset)
+    results = search_hyperparameters(args, search_space, 1, trainset, devset)
     
     best_trial = result.best_trial
     print("Best trial config: {}".format(best_trial.config))
