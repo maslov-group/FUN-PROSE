@@ -203,12 +203,36 @@ class Trainable(tune.Trainable):
         self.scaler = scaler()
         self.tensorize = Tensorize(char_vocab, config["seq_length"])
         self.char_vocab = char_vocab
-        self.train_loader = DataLoader(trainset, batch_size=config["batch_size"], num_workers=8, pin_memory=True, shuffle=True)
-        self.dev_loader = DataLoader(devset, batch_size=config["batch_size"], num_workers=8, pin_memory=True, shuffle=False)
+        self.train_loader = DataLoader(trainset, batch_size=config["batch_size"], num_workers=4, pin_memory=True, shuffle=True)
+        self.dev_loader = DataLoader(devset, batch_size=config["batch_size"], num_workers=4, pin_memory=True, shuffle=False)
+
+        self.best_dev_corr = 0
             
         self.net = cudaify_model(ProCNN(config, output_classes, char_vocab))
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=config["learning_rate"])
         self.loss = torch.nn.MSELoss()
+
+        self.terminate = False
+
+    def cleanup(self):
+        self.terminate = True
+
+        del self.config
+        del self.use_cuda
+        del self.scaler
+        del self.tensorize
+        del self.char_vocab
+        del self.train_loader
+        del self.dev_loader
+
+        del self.best_dev_corr
+
+        del self.net
+        del self.optimizer
+        del self.loss
+
+        torch.cuda.empty_cache()
+
         
     @classmethod
     def correlation(self, x, y):
@@ -220,11 +244,13 @@ class Trainable(tune.Trainable):
         self.net.eval()
         with torch.no_grad():
             dev_loss, dev_corr = self.run_one_cycle(train=False)
+            self.best_dev_corr = max(self.best_dev_corr, dev_corr)
         
         return {
                 "train_loss" : train_loss,
                 "dev_loss" : dev_loss,
-                "dev_corr" : dev_corr
+                "dev_corr" : dev_corr,
+                "best_dev_corr" : self.best_dev_corr,
         }
     
     def run_one_cycle(self, train=True):
@@ -235,7 +261,10 @@ class Trainable(tune.Trainable):
             all_preds = []
         
         for i, data in enumerate(self.train_loader if train else self.dev_loader):
-            print(i, "/", len(self.train_loader if train else self.dev_loader))
+            if self.terminate:
+                return None
+            if i % 10 == 0:
+                print(i, "/", len(self.train_loader if train else self.dev_loader))
             if train:
                 self.optimizer.zero_grad()
         
@@ -270,6 +299,7 @@ class Trainable(tune.Trainable):
         path = os.path.join(checkpoint_dir, "checkpoint.pt")
         
         torch.save({
+            "best_dev_corr" : self.best_dev_corr,
             "model_state_dict": self.net.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict()
         }, path)
@@ -281,6 +311,8 @@ class Trainable(tune.Trainable):
     def load_checkpoint(self, checkpoint_path):
         path = os.path.join(checkpoint_path, "checkpoint.pt")
         state = torch.load(path)
+
+        self.best_dev_corr = state["best_dev_corr"]
         self.net.load_state_dict(state["model_state_dict"])
         self.optimizer.load_state_dict(state["optimizer_state_dict"])        
             
@@ -311,7 +343,7 @@ def search_hyperparameters(args, search_space, output_classes, trainset, devset)
         time_attr='training_iteration',
         metric='dev_corr',
         mode='max',
-        max_t=50,
+        max_t=20,
         grace_period=5,
         reduction_factor=3,
         brackets=1
@@ -325,7 +357,7 @@ def search_hyperparameters(args, search_space, output_classes, trainset, devset)
                                             devset=devset),
                         config=search_space,
                         name=args.name,
-                        resources_per_trial={"cpu" : 16, "gpu" : 0.5},
+                        resources_per_trial={"cpu" : 2, "gpu" : 0.11},
                         num_samples=args.num_trials,
                         search_alg=bayesopt,
                         scheduler=scheduler,
@@ -392,7 +424,7 @@ if __name__ == "__main__":
        "conv2_ksize": tune.choice([9, 11, 13, 15]),
        "conv2_knum": tune.choice([16, 32, 64, 128, 256]),
        "pool2": tune.randint(5,10),
-       "batch_size": tune.choice([16, 32, 64, 128, 256]),
+       "batch_size": tune.choice([64, 128, 256, 512, 1024]),
        "conv_activation" : tune.choice(["relu", "gelu", "elu", "selu"]),
        "fc_activation" : tune.choice(["relu", "gelu", "elu", "selu"]),
        "conv_dropout": tune.uniform(0, 0.50),
@@ -403,8 +435,8 @@ if __name__ == "__main__":
 
 
     print("Loading data")
-    trainset = PandasDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_trainGenes.pkl')
-    devset = PandasDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_validGenes.pkl')
+    trainset = PandasDataset('~/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_trainGenes.pkl')
+    devset = PandasDataset('~/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_validGenes.pkl')
     print("Loaded data")
     results = search_hyperparameters(args, search_space, 1, trainset, devset)
     
