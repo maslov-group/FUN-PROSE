@@ -104,30 +104,32 @@ class ProCNN(torch.nn.Module):
         self.pool1 = torch.nn.MaxPool1d(kernel_size=config["pool1"], stride=config["pool1"])
         self.activation1 = self.get_activation(config["conv_activation"])
         self.conv1dropout = torch.nn.Dropout(config["conv_dropout"])
+        self.conv1bn = torch.nn.BatchNorm1d(config["conv1_knum"])
         
         self.conv2 = torch.nn.Conv1d(config["conv1_knum"],config["conv2_knum"], kernel_size=config["conv2_ksize"], stride=1, padding=config["conv2_ksize"]//2)
         self.pool2 = torch.nn.MaxPool1d(kernel_size=config["pool2"], stride=config["pool2"])
         self.activation2 = self.get_activation(config["conv_activation"])
         self.conv2dropout = torch.nn.Dropout(config["conv_dropout"])
+        self.conv2bn = torch.nn.BatchNorm1d(config["conv2_knum"])
         
         self.fc_t = torch.nn.Linear(325,self.xt_hidden) #assuming 325 TFs
         self.fc_t_activation = self.get_activation(config["fc_activation"])
         self.fc_t_dropout = torch.nn.Dropout(config["fc_dropout"])
         
         self.fc1 = torch.nn.Linear(config["conv2_knum"]*self.xs_hidden+self.xt_hidden, 512)
-        self.bn1 = torch.nn.BatchNorm1d(num_features=512)
         self.fc1_activation = self.get_activation(config["fc_activation"])
         self.fc1_dropout = torch.nn.Dropout(config["fc_dropout"])
+        self.bn1 = torch.nn.BatchNorm1d(num_features=512)
         
         self.fc2 = torch.nn.Linear(512, 256)
-        self.bn2 = torch.nn.BatchNorm1d(num_features=256)
         self.fc2_activation = self.get_activation(config["fc_activation"])
         self.fc2_dropout = torch.nn.Dropout(config["fc_dropout"])
+        self.bn2 = torch.nn.BatchNorm1d(num_features=256)
         
         self.fc3 = torch.nn.Linear(256, 64)
-        self.bn3 = torch.nn.BatchNorm1d(num_features=64)
         self.fc3_activation = self.get_activation(config["fc_activation"])
         self.fc3_dropout = torch.nn.Dropout(config["fc_dropout"])
+        self.bn3 = torch.nn.BatchNorm1d(num_features=64)
         
         self.fc_out = torch.nn.Linear(64,1)
         
@@ -153,11 +155,13 @@ class ProCNN(torch.nn.Module):
         x_s = self.pool1(x_s)
         x_s = self.activation1(x_s)
         x_s = self.conv1dropout(x_s)
+        x_s = self.conv1bn(x_s)
         
         x_s = self.conv2(x_s)
         x_s = self.pool2(x_s)
         x_s = self.activation2(x_s)
         x_s = self.conv2dropout(x_s)
+        x_s = self.conv2bn(x_s)
         
         x_t = self.fc_t(x_t)
         x_t = self.fc_t_activation(x_t)
@@ -165,19 +169,19 @@ class ProCNN(torch.nn.Module):
         
         x = torch.cat((x_s.reshape((b,self.config["conv2_knum"]*self.xs_hidden,1)).view(-1, self.config["conv2_knum"]*self.xs_hidden),x_t),1)
         x = self.fc1(x)
-        x = self.bn1(x)
         x = self.fc1_activation(x)
         x = self.fc1_dropout(x)
+        x = self.bn1(x)
         
         x = self.fc2(x)
-        x = self.bn2(x)
         x = self.fc2_activation(x)
         x = self.fc2_dropout(x)
+        x = self.bn2(x)
         
         x = self.fc3(x)
-        x = self.bn3(x)
         x = self.fc3_activation(x)
         x = self.fc3_dropout(x)
+        x = self.bn3(x)
         
         x = self.fc_out(x)
         #print(self.convs[0].weight.data)
@@ -209,7 +213,7 @@ class Trainable(tune.Trainable):
         self.best_dev_corr = 0
             
         self.net = cudaify_model(ProCNN(config, output_classes, char_vocab))
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=config["learning_rate"])
+        self.optimizer = torch.optim.AdamW(self.net.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
         self.loss = torch.nn.MSELoss()
 
         self.terminate = False
@@ -357,7 +361,7 @@ def search_hyperparameters(args, search_space, output_classes, trainset, devset)
                                             devset=devset),
                         config=search_space,
                         name=args.name,
-                        resources_per_trial={"cpu" : 2, "gpu" : 0.11},
+                        resources_per_trial={"cpu" : 3, "gpu" : 0.16},
                         num_samples=args.num_trials,
                         search_alg=bayesopt,
                         scheduler=scheduler,
@@ -416,6 +420,7 @@ if __name__ == "__main__":
 
     search_space = {
        "learning_rate": tune.loguniform(1e-5, 1e-2),
+       "weight_decay": tune.loguniform(1e-3, 1e-1),
        "xt_hidden": tune.choice([32, 64, 128, 256, 512, 1024]),
        "seq_length": tune.choice([i * 100 for i in range(2, 11)]),
        "conv1_ksize": tune.choice([9, 11, 13, 15]),
