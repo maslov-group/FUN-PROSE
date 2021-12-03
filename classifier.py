@@ -361,7 +361,7 @@ def search_hyperparameters(args, search_space, output_classes, trainset, devset)
                                             devset=devset),
                         config=search_space,
                         name=args.name,
-                        resources_per_trial={"cpu" : 3, "gpu" : 0.16},
+                        resources_per_trial={"cpu" : 1, "gpu" : 0.15},
                         num_samples=args.num_trials,
                         search_alg=bayesopt,
                         scheduler=scheduler,
@@ -369,7 +369,7 @@ def search_hyperparameters(args, search_space, output_classes, trainset, devset)
                         max_concurrent_trials=args.num_concurrent,
                         checkpoint_freq=1,
                         checkpoint_at_end=True,
-                        fail_fast=True,
+                        max_failures=3,
                         resume="AUTO")
     
     return results
