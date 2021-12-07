@@ -3,8 +3,6 @@ from copy import deepcopy
 import os
 import pandas as pd
 import ray
-from ray import tune
-from ray.tune.suggest.skopt import SkOptSearch
 from scipy.stats import pearsonr
 import torch
 from torch.utils.data import DataLoader
@@ -188,7 +186,7 @@ class ProCNN(torch.nn.Module):
         #yay!
         return x    
     
-class Trainable(tune.Trainable):
+class Trainable():
     
     def setup(self, config, output_classes, char_vocab, trainset, devset):
         """
@@ -321,7 +319,7 @@ class Trainable(tune.Trainable):
         self.optimizer.load_state_dict(state["optimizer_state_dict"])        
             
 
-def search_hyperparameters(args, search_space, output_classes, trainset, devset):
+def run_single_model(args, mode_config, output_classes, trainset, devset):
     """
     Performs a hyperparameter search of the best-performing network
     for the given datasets (training and development).
@@ -337,61 +335,23 @@ def search_hyperparameters(args, search_space, output_classes, trainset, devset)
 
     char_vocab = Vocab(extract_amino_acid_alphabet(trainset))    
 
-    bayesopt = SkOptSearch(metric="dev_corr", mode="max")
+    trainer = Trainable()
+    trainer.setup(config=config,char_vocab=char_vocab, output_classes=output_classes, trainset=trainset, devset=devset)
     
-    # Early stopper for plateauing metrics
-    stopper = ray.tune.stopper.TrialPlateauStopper("dev_corr", std=0.01, num_results=5, grace_period=5)
-    
-    # https://arxiv.org/pdf/1810.05934.pdf
-    scheduler = tune.schedulers.ASHAScheduler(
-        time_attr='training_iteration',
-        metric='dev_corr',
-        mode='max',
-        max_t=20,
-        grace_period=5,
-        reduction_factor=3,
-        brackets=1
-    )
-
-    print("Starting search")
-    results = tune.run(tune.with_parameters(Trainable, 
-                                            char_vocab=char_vocab,
-                                            output_classes=output_classes,
-                                            trainset=trainset,
-                                            devset=devset),
-                        config=search_space,
-                        name=args.name,
-                        resources_per_trial={"cpu" : 1, "gpu" : 0.15},
-                        num_samples=args.num_trials,
-                        search_alg=bayesopt,
-                        scheduler=scheduler,
-                        stop=stopper,
-                        max_concurrent_trials=args.num_concurrent,
-                        checkpoint_freq=1,
-                        checkpoint_at_end=True,
-                        max_failures=3,
-                        resume="AUTO")
+    epoch = 1
+    while True:
+        print(f"Epoch {epoch} ", trainer.step())
+        epoch += 1
     
     return results
 
 
 if __name__ == "__main__":
 
-    parser = argparse.ArgumentParser(description="Hyperparameter search for FUN-PROSE")
-    parser.add_argument("-name", type=str, required=True)
-    parser.add_argument("-num_cpus", type=int, required=True)
-    parser.add_argument("-num_trials", type=int, required=True)
-    parser.add_argument("-num_concurrent", type=int, required=True)
+    parser = argparse.ArgumentParser(description="Run single classifier for FUN-PROSE")
     parser.add_argument("-use_cuda", type=bool, default=False)
     args = parser.parse_args()
-
-    ray.init(
-            num_cpus = args.num_cpus,
-            object_store_memory=1*1024*1024*1024,
-            _redis_max_memory=1*1024*1024*1024,
-            include_dashboard=False,
-    )
-
+    
     if args.use_cuda:
         print("Using GPU")
         FloatTensor = torch.cuda.FloatTensor
@@ -418,23 +378,23 @@ if __name__ == "__main__":
                 pass
         scaler = MockScaler
 
-    search_space = {
-       "learning_rate": tune.loguniform(1e-5, 1e-2),
-       "weight_decay": tune.loguniform(1e-3, 1e-1),
-       "xt_hidden": tune.choice([32, 64, 128, 256, 512, 1024]),
-       "seq_length": tune.choice([i * 100 for i in range(2, 11)]),
-       "conv1_ksize": tune.choice([9, 11, 13, 15]),
-       "conv1_knum": tune.choice([16, 32, 64, 128, 256]),
-       "pool1": tune.randint(5,20),
-       "conv2_ksize": tune.choice([9, 11, 13, 15]),
-       "conv2_knum": tune.choice([16, 32, 64, 128, 256]),
-       "pool2": tune.randint(5,10),
-       "batch_size": tune.choice([64, 128, 256, 512, 1024]),
-       "conv_activation" : tune.choice(["relu", "gelu", "elu", "selu"]),
-       "fc_activation" : tune.choice(["relu", "gelu", "elu", "selu"]),
-       "conv_dropout": tune.uniform(0, 0.50),
-       "tf_dropout": tune.uniform(0, 0.50),
-       "fc_dropout": tune.uniform(0, 0.50),
+    config = {
+       "learning_rate": 0.00010229218879330196,
+       "weight_decay": 0.0016447149582678627,
+       "xt_hidden": 1024,
+       "seq_length": 1000,
+       "conv1_ksize": 9,
+       "conv1_knum": 256,
+       "pool1": 19,
+       "conv2_ksize": 13,
+       "conv2_knum": 64,
+       "pool2": 8,
+       "batch_size": 256,
+       "conv_activation" : "relu",
+       "fc_activation" : "elu",
+       "conv_dropout": 0.3981796388676127,
+       "tf_dropout": 0.18859739941162465,
+       "fc_dropout": 0.016570328292903613,
        "use_cuda": args.use_cuda,
     }
 
@@ -443,7 +403,6 @@ if __name__ == "__main__":
     trainset = PandasDataset('~/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_trainGenes.pkl')
     devset = PandasDataset('~/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_validGenes.pkl')
     print("Loaded data")
-    results = search_hyperparameters(args, search_space, 1, trainset, devset)
-    print(results.results_df)
-    results.results_df.to_csv("results.csv", index=False)
+
+    run_single_model(args, config, 1, trainset, devset)
 
