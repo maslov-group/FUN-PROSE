@@ -73,8 +73,9 @@ class Tensorize:
         """
         tensor = torch.zeros(len(words), len(vocab), max_word_length)
         for i, word in enumerate(words):
-            for li, letter in enumerate(word[len(word) - max_word_length:]):
-                tensor[i][vocab(letter)][li] = 1
+            start_index = max(0, len(word) - max_word_length)
+            for li, letter in enumerate(word[start_index:len(word)][::-1]):
+                tensor[i][vocab(letter)][max_word_length - li - 1] = 1
         return tensor
 
 class ProCNN(torch.nn.Module):

@@ -1,8 +1,6 @@
 import argparse
-from copy import deepcopy
 import os
 import pandas as pd
-import ray
 from scipy.stats import pearsonr
 import torch
 from torch.utils.data import DataLoader
@@ -10,6 +8,7 @@ from torch.utils.data import DataLoader
 from data import PandasDataset
 
 torch.backends.cudnn.benchmark = True
+
 
 class Vocab:
     """
@@ -43,9 +42,10 @@ class Tensorize:
     a neural network.
     """
     
-    def __init__(self, symbol_vocab, max_word_length):
+    def __init__(self, symbol_vocab, max_word_length, cudaify):
         self.symbol_vocab = symbol_vocab
         self.max_word_length = max_word_length
+        self.cudaify = cudaify
     
     def __call__(self, data):
         words = Tensorize.words_to_tensor(data['seq'], 
@@ -54,7 +54,7 @@ class Tensorize:
         
         tfs = torch.stack(data['tfs'],dim=1).float()
         label = data['exp'].float()
-        return cudaify(words), cudaify(tfs), cudaify(label)
+        return self.cudaify(words), self.cudaify(tfs), self.cudaify(label)
         
     @staticmethod
     def words_to_tensor(words, vocab, max_word_length):
@@ -71,9 +71,11 @@ class Tensorize:
         """
         tensor = torch.zeros(len(words), len(vocab), max_word_length)
         for i, word in enumerate(words):
-            for li, letter in enumerate(word[len(word) - max_word_length:]):
-                tensor[i][vocab(letter)][li] = 1
+            start_index = max(0, len(word) - max_word_length)
+            for li, letter in enumerate(word[start_index:len(word)][::-1]):
+                tensor[i][vocab(letter)][max_word_length - li - 1] = 1
         return tensor
+    
 
 class ProCNN(torch.nn.Module):
     """
@@ -105,7 +107,7 @@ class ProCNN(torch.nn.Module):
         self.conv2dropout = torch.nn.Dropout(config["conv_dropout"])
         self.conv2bn = torch.nn.BatchNorm1d(config["conv2_knum"])
         
-        self.fc_t = torch.nn.Linear(325,self.xt_hidden) #assuming 325 TFs
+        self.fc_t = torch.nn.Linear(config["num_tfs"],self.xt_hidden)
         self.fc_t_activation = self.get_activation(config["fc_activation"])
         self.fc_t_dropout = torch.nn.Dropout(config["fc_dropout"])
         
@@ -177,10 +179,18 @@ class ProCNN(torch.nn.Module):
         x = self.bn3(x)
         
         x = self.fc_out(x)
-        return x    
+        return x
     
 class Trainable():
     
+    class MockScaler():
+        def scale(self, x):
+            return x
+        def step(self, optim):
+            optim.step()
+        def update(self):
+            pass
+        
     def setup(self, config, output_classes, char_vocab, trainset, devset):
         """
         Initializes a trainer to train a neural network using the provided DataLoaders 
@@ -194,16 +204,24 @@ class Trainable():
         """
         print("Setting up Trainable")
         self.config = config
-        self.use_cuda = config["use_cuda"]
-        self.scaler = scaler()
-        self.tensorize = Tensorize(char_vocab, config["seq_length"])
         self.char_vocab = char_vocab
         self.train_loader = DataLoader(trainset, batch_size=config["batch_size"], num_workers=4, pin_memory=True, shuffle=True)
         self.dev_loader = DataLoader(devset, batch_size=config["batch_size"], num_workers=4, pin_memory=True, shuffle=False)
 
         self.best_dev_corr = 0
-            
-        self.net = cudaify_model(ProCNN(config, output_classes, char_vocab))
+        
+        self.use_cuda = config["use_cuda"]
+        if self.use_cuda:
+            self.cudaify_model = lambda x: x.cuda()
+            self.cudaify = lambda x: x.cuda(non_blocking=True)
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.cudaify_model = lambda x: x
+            self.cudaify = lambda x: x
+            self.scaler = MockScaler()
+        
+        self.tensorize = Tensorize(char_vocab, config["seq_length"], self.cudaify)
+        self.net = self.cudaify_model(ProCNN(config, output_classes, char_vocab))
         self.optimizer = torch.optim.AdamW(self.net.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
         self.loss = torch.nn.MSELoss()
 
@@ -213,14 +231,17 @@ class Trainable():
         self.terminate = True
 
         del self.config
-        del self.use_cuda
-        del self.scaler
         del self.tensorize
         del self.char_vocab
         del self.train_loader
         del self.dev_loader
 
         del self.best_dev_corr
+        
+        del self.use_cuda
+        del self.cudaify_model
+        del self.cudaify
+        del self.scaler
 
         del self.net
         del self.optimizer
@@ -339,32 +360,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run single classifier for FUN-PROSE")
     parser.add_argument("-use_cuda", type=bool, default=False)
     args = parser.parse_args()
-    
-    if args.use_cuda:
-        print("Using GPU")
-        FloatTensor = torch.cuda.FloatTensor
-        LongTensor = torch.cuda.LongTensor
-        def cudaify_model(x):
-            return x.cuda()
-        def cudaify(x):
-            return x.cuda(non_blocking=True)
-        scaler = torch.cuda.amp.GradScaler
-    else:
-        print("Using CPU")
-        FloatTensor = torch.FloatTensor
-        LongTensor = torch.LongTensor
-        def cudaify_model(x):
-            return x
-        def cudaify(x):
-            return x
-        class MockScaler():
-            def scale(self, x):
-                return x
-            def step(self, optim):
-                optim.step()
-            def update(self):
-                pass
-        scaler = MockScaler
 
     config = {
        "learning_rate": 0.00010229218879330196,
@@ -384,12 +379,13 @@ if __name__ == "__main__":
        "tf_dropout": 0.18859739941162465,
        "fc_dropout": 0.016570328292903613,
        "use_cuda": args.use_cuda,
+       "num_tfs":325
     }
 
 
     print("Loading data")
-    trainset = PandasDataset('~/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_trainGenes.pkl')
-    devset = PandasDataset('~/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_validGenes.pkl')
+    trainset = PandasDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_trainGenes.pkl')
+    devset = PandasDataset('/home/simonl2/yeast/Gene_Expression_Pred/October_Runs/Data/file_oav_filt05_filtcv3_Zlog_new_validGenes.pkl')
     print("Loaded data")
 
     run_single_model(args, config, 1, trainset, devset)
