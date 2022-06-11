@@ -4,6 +4,25 @@ import random
 import json
 import pandas as pd
 
+
+class PandasDataset(Dataset):
+    """
+    Creates a Torch Dataset from a Pandas pickle file.
+    """
+    def __init__(self, pd_file):
+        self.data = pd.read_pickle(pd_file)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data.loc[idx].to_dict()
+
+    def select(self, field):
+        for _, datum in self.data.iterrows():
+            yield datum[field]
+            
+            
 class JsonDataset(Dataset):
     """
     Creates a Torch Dataset from a JSON file.
