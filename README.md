@@ -1,4 +1,4 @@
-Fungi_Gene_Expression
+# Fungi_Gene_Expression
 
 The processed data and test outputs can be found here: https://drive.google.com/drive/folders/19K5DxFVpjozpd1rKnBvZZzDmnPp1-Ldw?usp=sharing
 
